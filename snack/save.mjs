@@ -3,25 +3,29 @@
 
 import fs from 'node:fs';
 
-const code = fs.readFileSync('/tmp/snack-App.js', 'utf8');
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const code = fs.readFileSync(path.join(__dirname, 'App.js'), 'utf8');
 
 const payload = {
   manifest: {
     name: 'CaddyAI',
     description: 'Golf swing tracking + practice feedback (local-only, SQLite).',
     slug: 'caddyai',
-    sdkVersion: '52.0.0',
+    sdkVersion: '54.0.0',
     dependencies: {
-      'expo-sqlite': '~15.0.3',
-      'expo-status-bar': '~2.0.0',
+      'expo-sqlite': '*',
+      'expo-status-bar': '*',
     },
   },
   code: {
     'App.js': { contents: code, type: 'CODE' },
   },
   dependencies: {
-    'expo-sqlite': { version: '~15.0.3' },
-    'expo-status-bar': { version: '~2.0.0' },
+    'expo-sqlite': { version: '*' },
+    'expo-status-bar': { version: '*' },
   },
 };
 
