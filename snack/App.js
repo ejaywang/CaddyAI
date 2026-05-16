@@ -134,9 +134,17 @@ async function processFrame(id, dataUrl) {
     ctx.drawImage(img, 0, 0);
     const result = landmarker.detect(canvas);
     const lm = (result.landmarks && result.landmarks[0]) || [];
-    const keypoints = lm.map((p) => ({
-      x: p.x, y: p.y, score: p.visibility != null ? p.visibility : 1,
-    }));
+    const wlm = (result.worldLandmarks && result.worldLandmarks[0]) || [];
+    const keypoints = lm.map((p, i) => {
+      const w = wlm[i];
+      return {
+        x: p.x, y: p.y,
+        score: p.visibility != null ? p.visibility : 1,
+        wx: w ? w.x : null,
+        wy: w ? w.y : null,
+        wz: w ? w.z : null,
+      };
+    });
     post({ type: 'result', id, keypoints });
   } catch (e) {
     post({ type: 'result', id, error: String(e) });
@@ -156,8 +164,52 @@ init();
 </script></body></html>
 `;
 
+// ---------- 3D vector helpers ----------
+const Vec = {
+  sub: (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]],
+  scale: (a, k) => [a[0]*k, a[1]*k, a[2]*k],
+  dot: (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2],
+  norm: (a) => Math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]),
+  unit: (a) => { const n = Vec.norm(a); return n > 1e-9 ? Vec.scale(a, 1/n) : a; },
+  projectPlane: (a, normal) => {
+    const u = Vec.unit(normal);
+    return Vec.sub(a, Vec.scale(u, Vec.dot(a, u)));
+  },
+  angle: (a, b) => {
+    const an = Vec.norm(a), bn = Vec.norm(b);
+    if (an < 1e-9 || bn < 1e-9) return 0;
+    const c = Math.max(-1, Math.min(1, Vec.dot(a, b) / (an * bn)));
+    return Math.acos(c);
+  },
+};
+
+function world(frame, idx) {
+  const kp = frame && frame[idx];
+  if (!kp || kp.wx == null) return null;
+  return [kp.wx, kp.wy, kp.wz];
+}
+
+function midpoint3(a, b) {
+  return (a && b) ? [(a[0]+b[0])/2, (a[1]+b[1])/2, (a[2]+b[2])/2] : null;
+}
+
+// Angle between the left↔right vector of `leftIdx`/`rightIdx` joints at frame A
+// vs frame B, projected onto the plane perpendicular to the spine. View-agnostic.
+function rotationAroundSpine(frameA, frameB, leftIdx, rightIdx) {
+  const lA = world(frameA, leftIdx), rA = world(frameA, rightIdx);
+  const lB = world(frameB, leftIdx), rB = world(frameB, rightIdx);
+  if (!lA || !rA || !lB || !rB) return 0;
+  const shouldersMidB = midpoint3(world(frameB, KP.L_SHOULDER), world(frameB, KP.R_SHOULDER));
+  const hipsMidB = midpoint3(world(frameB, KP.L_HIP), world(frameB, KP.R_HIP));
+  if (!shouldersMidB || !hipsMidB) return 0;
+  const spine = Vec.sub(shouldersMidB, hipsMidB);
+  const vAp = Vec.projectPlane(Vec.sub(rA, lA), spine);
+  const vBp = Vec.projectPlane(Vec.sub(rB, lB), spine);
+  return Math.round(Vec.angle(vAp, vBp) * 180 / Math.PI);
+}
+
 // ---------- analysis (metrics + text from keypoint timeline) ----------
-function analyzeKeypoints(frames, frameTimestamps) {
+function analyzeKeypoints(frames, frameTimestamps, view) {
   let topIdx = 0;
   let minY = 1;
   for (let i = 0; i < frames.length; i++) {
@@ -187,37 +239,31 @@ function analyzeKeypoints(frames, frameTimestamps) {
   }
   const finishIdx = frames.length - 1;
 
-  let noseXMin = 1, noseXMax = 0, noseYMin = 1, noseYMax = 0;
+  // 3D head stability: bounding-box diagonal of nose movement in real-world meters.
+  // Threshold tuned at 8cm (top players stay within ~5cm).
+  let xMin = Infinity, xMax = -Infinity;
+  let yMin = Infinity, yMax = -Infinity;
+  let zMin = Infinity, zMax = -Infinity;
   let noseSamples = 0;
   for (let i = 0; i <= impactIdx; i++) {
-    const n = frames[i] && frames[i][KP.NOSE];
-    if (!n || n.score < 0.3) continue;
-    noseXMin = Math.min(noseXMin, n.x);
-    noseXMax = Math.max(noseXMax, n.x);
-    noseYMin = Math.min(noseYMin, n.y);
-    noseYMax = Math.max(noseYMax, n.y);
+    const w = world(frames[i], KP.NOSE);
+    if (!w) continue;
+    if (w[0] < xMin) xMin = w[0]; if (w[0] > xMax) xMax = w[0];
+    if (w[1] < yMin) yMin = w[1]; if (w[1] > yMax) yMax = w[1];
+    if (w[2] < zMin) zMin = w[2]; if (w[2] > zMax) zMax = w[2];
     noseSamples++;
   }
-  const headRange = noseSamples > 0
-    ? Math.hypot(noseXMax - noseXMin, noseYMax - noseYMin)
+  const headRange3D = noseSamples > 0
+    ? Math.hypot(xMax - xMin, yMax - yMin, zMax - zMin)
     : 0;
-  const headStability = Math.round((1 - Math.min(1, headRange / 0.08)) * 100);
+  const headStability = Math.round((1 - Math.min(1, headRange3D / 0.08)) * 100);
 
+  // 3D rotations around the spine axis (view-agnostic).
+  const addressF = frames[0];
   const topF = frames[topIdx];
-  const shoulderTurnDeg = topF && topF[KP.L_SHOULDER] && topF[KP.R_SHOULDER]
-    ? Math.round(Math.abs(Math.atan2(
-        topF[KP.R_SHOULDER].y - topF[KP.L_SHOULDER].y,
-        topF[KP.R_SHOULDER].x - topF[KP.L_SHOULDER].x
-      ) * 180 / Math.PI))
-    : 0;
-
   const impactF = frames[impactIdx];
-  const hipTurnDeg = impactF && impactF[KP.L_HIP] && impactF[KP.R_HIP]
-    ? Math.round(Math.abs(Math.atan2(
-        impactF[KP.R_HIP].y - impactF[KP.L_HIP].y,
-        impactF[KP.R_HIP].x - impactF[KP.L_HIP].x
-      ) * 180 / Math.PI))
-    : 0;
+  const shoulderTurnDeg = rotationAroundSpine(addressF, topF, KP.L_SHOULDER, KP.R_SHOULDER);
+  const hipTurnDeg = rotationAroundSpine(addressF, impactF, KP.L_HIP, KP.R_HIP);
 
   const backswingSec = frameTimestamps[topIdx] - frameTimestamps[0];
   const downswingSec = Math.max(0.01, frameTimestamps[impactIdx] - frameTimestamps[topIdx]);
@@ -246,16 +292,20 @@ function buildInsights({ headStability, shoulderTurnDeg, hipTurnDeg, tempo, rati
   else if (headStability >= 60) out.push(`Some head drift (${headStability}/100). Pick a spot on the ball and keep eyes on it through impact.`);
   else out.push(`Head moved a lot (${headStability}/100). Try the "eyes on a spot" drill — fixed gaze for the full swing.`);
 
-  if (shoulderTurnDeg > 0 && shoulderTurnDeg < 10) out.push(`Shoulder turn looks shallow (${shoulderTurnDeg}°). Lead shoulder under the chin at the top.`);
-  else if (shoulderTurnDeg > 0) out.push(`Shoulder turn ~${shoulderTurnDeg}° — solid coil.`);
+  // Pro shoulder turn at top ~85-100°. Under 70 is shallow.
+  if (shoulderTurnDeg > 0 && shoulderTurnDeg < 70) out.push(`Shoulder turn shallow (${shoulderTurnDeg}°). Pros sit ~90° at the top — get the lead shoulder under the chin.`);
+  else if (shoulderTurnDeg >= 70 && shoulderTurnDeg <= 110) out.push(`Shoulder turn ${shoulderTurnDeg}° — solid coil.`);
+  else if (shoulderTurnDeg > 110) out.push(`Big shoulder turn (${shoulderTurnDeg}°). Powerful — make sure you're not losing posture to get there.`);
 
-  if (hipTurnDeg > 0 && hipTurnDeg < 5) out.push(`Hips not clearing through impact. Drill: feel the lead hip working back and around.`);
-  else if (hipTurnDeg > 0) out.push(`Hips opening ~${hipTurnDeg}° at impact — body leading the club through.`);
+  // Pro hip turn at impact ~40-50°. Under 25 means hips aren't clearing.
+  if (hipTurnDeg > 0 && hipTurnDeg < 25) out.push(`Hips barely cleared (${hipTurnDeg}°). Drill: feel the lead hip working back and around through impact.`);
+  else if (hipTurnDeg >= 25 && hipTurnDeg <= 60) out.push(`Hips opening ${hipTurnDeg}° at impact — body leading the club through.`);
+  else if (hipTurnDeg > 60) out.push(`Hips very open at impact (${hipTurnDeg}°) — fast lower body. Watch that the upper body keeps up.`);
 
   if (isFinite(ratio) && ratio > 0) {
     if (tempo === 'on-tempo') out.push(`Tempo ${ratio.toFixed(2)}:1 — near pro 3:1 ratio.`);
-    else if (tempo === 'quick') out.push(`Tempo is quick (${ratio.toFixed(2)}:1, pros sit ~3:1). Pause at the top.`);
-    else out.push(`Tempo is slow (${ratio.toFixed(2)}:1, pros sit ~3:1). Let the club fall — don't steer.`);
+    else if (tempo === 'quick') out.push(`Tempo quick (${ratio.toFixed(2)}:1, pros sit ~3:1). Pause at the top.`);
+    else out.push(`Tempo slow (${ratio.toFixed(2)}:1, pros sit ~3:1). Let the club fall — don't steer.`);
   }
   return out;
 }
@@ -331,6 +381,7 @@ export default function App() {
   const [progress, setProgress] = useState({ done: 0, total: 0, label: '' });
   const [analysis, setAnalysis] = useState(null);
   const [error, setError] = useState(null);
+  const [view, setView] = useState('face-on'); // 'face-on' | 'down-the-line'
 
   const pickAndAnalyze = useCallback(async () => {
     setError(null);
@@ -387,8 +438,8 @@ export default function App() {
         throw new Error('No pose detected in this video. Try a clearer full-body swing video.');
       }
 
-      const summary = analyzeKeypoints(dense, frameTimestamps);
-      setAnalysis({ frames: dense, frameTimestamps, durationSec: durationMs / 1000, ...summary });
+      const summary = analyzeKeypoints(dense, frameTimestamps, view);
+      setAnalysis({ frames: dense, frameTimestamps, view, durationSec: durationMs / 1000, ...summary });
       setStage('result');
     } catch (e) {
       setError(String(e.message || e));
@@ -414,6 +465,8 @@ export default function App() {
           ready={runner.ready}
           runnerError={runner.error}
           error={error}
+          view={view}
+          setView={setView}
         />
       )}
       {stage === 'analyzing' && <AnalyzingScreen progress={progress} />}
@@ -438,19 +491,42 @@ async function uriToDataUrl(uri) {
 }
 
 // ---------- screens ----------
-function HomeScreen({ onPick, ready, runnerError, error }) {
+function HomeScreen({ onPick, ready, runnerError, error, view, setView }) {
   return (
     <View style={styles.center}>
       <Text style={styles.brand}>CaddyAI</Text>
       <Text style={styles.tagline}>Swing analysis with on-device pose tracking</Text>
+
+      <Text style={styles.viewLabel}>Camera angle</Text>
+      <View style={styles.viewToggle}>
+        <Pressable
+          onPress={() => setView('face-on')}
+          style={[styles.viewBtn, view === 'face-on' && styles.viewBtnActive]}
+        >
+          <Text style={[styles.viewBtnText, view === 'face-on' && styles.viewBtnTextActive]}>
+            Face-on
+          </Text>
+          <Text style={styles.viewBtnHint}>golfer faces camera</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => setView('down-the-line')}
+          style={[styles.viewBtn, view === 'down-the-line' && styles.viewBtnActive]}
+        >
+          <Text style={[styles.viewBtnText, view === 'down-the-line' && styles.viewBtnTextActive]}>
+            Down-the-line
+          </Text>
+          <Text style={styles.viewBtnHint}>camera behind golfer</Text>
+        </Pressable>
+      </View>
 
       <Pressable onPress={onPick} disabled={!ready} style={[styles.cta, !ready && { opacity: 0.5 }]}>
         <Text style={styles.ctaText}>{ready ? 'Pick a swing video' : 'Loading pose model…'}</Text>
       </Pressable>
 
       <Text style={styles.hint}>
-        Choose a video of a full swing from your camera roll. Best results: face-on,
-        full body in frame, 2–5 seconds long.
+        {view === 'face-on'
+          ? 'Camera in front of you, body facing the lens, full body in frame, 2–5 seconds.'
+          : 'Camera behind you on the target line, capturing your back. Full body in frame, 2–5 seconds.'}
       </Text>
 
       {runnerError ? <Text style={styles.error}>Pose model error: {runnerError}</Text> : null}
@@ -656,7 +732,20 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32 },
   brand: { color: C.text, fontSize: 32, fontWeight: '700', letterSpacing: 0.5 },
   tagline: { color: C.dim, fontSize: 14, marginTop: 8, textAlign: 'center' },
-  cta: { marginTop: 36, backgroundColor: C.primary, paddingVertical: 14, paddingHorizontal: 32, borderRadius: 12 },
+  viewLabel: {
+    color: C.dim, fontSize: 11, textTransform: 'uppercase',
+    letterSpacing: 0.6, marginTop: 32, marginBottom: 8,
+  },
+  viewToggle: { flexDirection: 'row', gap: 8 },
+  viewBtn: {
+    flex: 1, paddingVertical: 12, paddingHorizontal: 14, borderRadius: 10,
+    borderWidth: 1, borderColor: C.border, backgroundColor: C.surface, alignItems: 'center',
+  },
+  viewBtnActive: { borderColor: C.primary, backgroundColor: C.primary + '22' },
+  viewBtnText: { color: C.text, fontSize: 14, fontWeight: '700' },
+  viewBtnTextActive: { color: C.primary },
+  viewBtnHint: { color: C.dim, fontSize: 10, marginTop: 2 },
+  cta: { marginTop: 28, backgroundColor: C.primary, paddingVertical: 14, paddingHorizontal: 32, borderRadius: 12 },
   ctaText: { color: '#03130B', fontSize: 16, fontWeight: '700' },
   hint: { color: C.dim, fontSize: 13, marginTop: 24, textAlign: 'center', lineHeight: 18 },
   footer: { color: C.dim, fontSize: 11, marginTop: 40, textAlign: 'center', lineHeight: 16, fontStyle: 'italic' },
