@@ -8,7 +8,7 @@ so it can run on a phone via Expo Go without a local dev environment.
 Open this URL on a phone (or any browser) and follow the "My Device" /
 QR-code instructions inside Expo Go:
 
-> https://snack.expo.dev/@snack/exIFJpJTYQSm9VGAzz769
+> https://snack.expo.dev/exIFJpJTYQSm9VGAzz769
 
 The Snack version is intentionally flattened: one `App.js`, state-based
 navigation between Feed and Log views, but the same SQLite schema and
