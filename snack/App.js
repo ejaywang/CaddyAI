@@ -157,7 +157,7 @@ init();
 `;
 
 // ---------- analysis (metrics + text from keypoint timeline) ----------
-function analyzeKeypoints(frames, fps) {
+function analyzeKeypoints(frames, frameTimestamps) {
   let topIdx = 0;
   let minY = 1;
   for (let i = 0; i < frames.length; i++) {
@@ -219,12 +219,12 @@ function analyzeKeypoints(frames, fps) {
       ) * 180 / Math.PI))
     : 0;
 
-  const backswingFrames = topIdx;
-  const downswingFrames = Math.max(1, impactIdx - topIdx);
-  const ratio = backswingFrames / downswingFrames;
+  const backswingSec = frameTimestamps[topIdx] - frameTimestamps[0];
+  const downswingSec = Math.max(0.01, frameTimestamps[impactIdx] - frameTimestamps[topIdx]);
+  const ratio = backswingSec / downswingSec;
   const tempo = ratio > 2.5 && ratio < 3.5 ? 'on-tempo' : ratio < 2.5 ? 'quick' : 'slow';
 
-  const durationMs = Math.round((finishIdx / fps) * 1000);
+  const durationMs = Math.round(frameTimestamps[finishIdx] * 1000);
 
   return {
     keyframes: { topIdx, impactIdx, finishIdx },
@@ -355,15 +355,17 @@ export default function App() {
 
     try {
       const durationMs = asset.duration || 3000;
-      const fps = 10; // sample at 10 fps; balance between detail and speed
-      const numFrames = Math.max(15, Math.min(60, Math.round((durationMs / 1000) * fps)));
+      const targetFps = 10; // sampling rate, not playback rate
+      const numFrames = Math.max(15, Math.min(60, Math.round((durationMs / 1000) * targetFps)));
       const stepMs = durationMs / (numFrames - 1);
+      const frameTimestamps = []; // seconds, one per frame
 
       const frames = new Array(numFrames).fill(null);
 
       for (let i = 0; i < numFrames; i++) {
         setProgress({ done: i, total: numFrames, label: 'Extracting frame' });
         const timeMs = Math.round(i * stepMs);
+        frameTimestamps.push(timeMs / 1000);
         const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(asset.uri, {
           time: timeMs,
           quality: 0.5,
@@ -375,9 +377,7 @@ export default function App() {
       }
 
       setProgress({ done: numFrames, total: numFrames, label: 'Computing metrics' });
-      // remove nulls / empty frames before analysis
       const dense = frames.map((f) => (f && f.length ? f : null));
-      // fill nulls by carrying forward last valid frame (so timeline is contiguous)
       let last = null;
       for (let i = 0; i < dense.length; i++) {
         if (dense[i]) last = dense[i];
@@ -387,8 +387,8 @@ export default function App() {
         throw new Error('No pose detected in this video. Try a clearer full-body swing video.');
       }
 
-      const summary = analyzeKeypoints(dense, fps);
-      setAnalysis({ frames: dense, fps, ...summary });
+      const summary = analyzeKeypoints(dense, frameTimestamps);
+      setAnalysis({ frames: dense, frameTimestamps, durationSec: durationMs / 1000, ...summary });
       setStage('result');
     } catch (e) {
       setError(String(e.message || e));
@@ -500,9 +500,7 @@ function ResultScreen({ videoUri, analysis, onReset }) {
     else { player.pause(); setPaused(true); }
   };
 
-  const totalSec = analysis.frames.length / analysis.fps;
-  const t = totalSec > 0 ? Math.min(1, currentTime / totalSec) : 0;
-  const frameIdx = Math.min(analysis.frames.length - 1, Math.floor(t * analysis.frames.length));
+  const frameIdx = frameIndexForTime(analysis.frameTimestamps, currentTime);
   const currentKeypoints = analysis.frames[frameIdx];
 
   return (
@@ -527,9 +525,9 @@ function ResultScreen({ videoUri, analysis, onReset }) {
 
       <KeyframeStrip
         keyframes={analysis.keyframes}
-        fps={analysis.fps}
+        frameTimestamps={analysis.frameTimestamps}
         currentFrame={frameIdx}
-        onSeek={(idx) => { try { player.currentTime = idx / analysis.fps; } catch (e) {} }}
+        onSeek={(idx) => { try { player.currentTime = analysis.frameTimestamps[idx]; } catch (e) {} }}
       />
 
       <View style={styles.metricsRow}>
@@ -606,7 +604,7 @@ function SkeletonOverlay({ keypoints, width, height }) {
   );
 }
 
-function KeyframeStrip({ keyframes, fps, currentFrame, onSeek }) {
+function KeyframeStrip({ keyframes, frameTimestamps, currentFrame, onSeek }) {
   const marks = [
     { label: 'Top', idx: keyframes.topIdx },
     { label: 'Impact', idx: keyframes.impactIdx },
@@ -621,11 +619,24 @@ function KeyframeStrip({ keyframes, fps, currentFrame, onSeek }) {
           style={[styles.keyframeBtn, Math.abs(currentFrame - m.idx) < 2 && styles.keyframeBtnActive]}
         >
           <Text style={styles.keyframeBtnText}>{m.label}</Text>
-          <Text style={styles.keyframeBtnTime}>{(m.idx / fps).toFixed(2)}s</Text>
+          <Text style={styles.keyframeBtnTime}>{(frameTimestamps[m.idx] ?? 0).toFixed(2)}s</Text>
         </Pressable>
       ))}
     </View>
   );
+}
+
+function frameIndexForTime(timestamps, t) {
+  if (!timestamps || timestamps.length === 0) return 0;
+  if (t <= timestamps[0]) return 0;
+  if (t >= timestamps[timestamps.length - 1]) return timestamps.length - 1;
+  let lo = 0, hi = timestamps.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (timestamps[mid] <= t) lo = mid;
+    else hi = mid;
+  }
+  return Math.abs(timestamps[lo] - t) < Math.abs(timestamps[hi] - t) ? lo : hi;
 }
 
 function Tile({ label, value, hint, tone = 'default' }) {
