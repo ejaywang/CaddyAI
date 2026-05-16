@@ -208,72 +208,114 @@ function rotationAroundSpine(frameA, frameB, leftIdx, rightIdx) {
   return Math.round(Vec.angle(vAp, vBp) * 180 / Math.PI);
 }
 
+function percentile(arr, p) {
+  if (!arr || arr.length === 0) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+}
+
 // ---------- analysis (metrics + text from keypoint timeline) ----------
 function analyzeKeypoints(frames, frameTimestamps, view) {
+  // Keyframe detection: find the top (argmin of smoothed hand y), then walk
+  // outward to find the address (last frame at address-height before top) and
+  // impact (first frame back to address-height after top). This handles videos
+  // that have dwell time before/after the swing.
+  const handY = frames.map((f) => {
+    if (!f) return null;
+    const lw = f[KP.L_WRIST], rw = f[KP.R_WRIST];
+    if (!lw || !rw) return null;
+    return (lw.y + rw.y) / 2;
+  });
+  const handYSmooth = handY.map((_, i) => {
+    const w = [handY[i - 1], handY[i], handY[i + 1]].filter((v) => v != null);
+    return w.length ? w.reduce((a, b) => a + b, 0) / w.length : null;
+  });
+
   let topIdx = 0;
-  let minY = 1;
-  for (let i = 0; i < frames.length; i++) {
-    const rw = frames[i] && frames[i][KP.R_WRIST];
-    if (rw && rw.score > 0.3 && rw.y < minY) {
-      minY = rw.y;
+  let minHandY = Infinity;
+  for (let i = 0; i < handYSmooth.length; i++) {
+    if (handYSmooth[i] != null && handYSmooth[i] < minHandY) {
+      minHandY = handYSmooth[i];
       topIdx = i;
     }
   }
-  let impactIdx = topIdx;
-  let bestDist = 1;
-  for (let i = topIdx; i < frames.length; i++) {
-    const f = frames[i];
-    if (!f) continue;
-    const lw = f[KP.L_WRIST], rw = f[KP.R_WRIST];
-    if (!lw || !rw) continue;
-    const hy = (lw.y + rw.y) / 2;
-    // estimate address from frame 0
-    const f0 = frames[0];
-    if (!f0) continue;
-    const addressY = (f0[KP.L_WRIST].y + f0[KP.R_WRIST].y) / 2;
-    const d = Math.abs(hy - addressY);
-    if (d < bestDist) {
-      bestDist = d;
-      impactIdx = i;
+
+  const preTop = handYSmooth.slice(0, topIdx).filter((v) => v != null);
+  const addressY = percentile(preTop, 0.9) ?? handYSmooth[0] ?? minHandY + 0.2;
+
+  let swingStart = 0;
+  for (let i = topIdx - 1; i >= 0; i--) {
+    if (handYSmooth[i] != null && handYSmooth[i] >= addressY * 0.95) {
+      swingStart = i;
+      break;
     }
   }
-  const finishIdx = frames.length - 1;
 
-  // 3D head stability: bounding-box diagonal of nose movement in real-world meters.
-  // Threshold tuned at 8cm (top players stay within ~5cm).
+  let impactIdx = -1;
+  for (let i = topIdx + 1; i < handYSmooth.length; i++) {
+    if (handYSmooth[i] != null && handYSmooth[i] >= addressY * 0.95) {
+      impactIdx = i;
+      break;
+    }
+  }
+  if (impactIdx === -1) {
+    let best = -Infinity;
+    for (let i = topIdx + 1; i < handYSmooth.length; i++) {
+      const a = handYSmooth[i - 1], b = handYSmooth[i];
+      if (a == null || b == null) continue;
+      const dt = Math.max(0.001, frameTimestamps[i] - frameTimestamps[i - 1]);
+      const dy = (b - a) / dt;
+      if (dy > best) { best = dy; impactIdx = i; }
+    }
+    if (impactIdx === -1) impactIdx = Math.min(handYSmooth.length - 1, topIdx + 1);
+  }
+
+  let finishIdx = handYSmooth.length - 1;
+  for (let i = impactIdx + 2; i < handYSmooth.length; i++) {
+    const a = handYSmooth[i - 1], b = handYSmooth[i], c = handYSmooth[i - 2];
+    if (a == null || b == null || c == null) continue;
+    const dt1 = Math.max(0.001, frameTimestamps[i] - frameTimestamps[i - 1]);
+    const dt2 = Math.max(0.001, frameTimestamps[i - 1] - frameTimestamps[i - 2]);
+    if (Math.abs(b - a) / dt1 < 0.03 && Math.abs(a - c) / dt2 < 0.03) {
+      finishIdx = i - 1;
+      break;
+    }
+  }
+
+  // Head stability over the active swing window, in image space. World coords
+  // are camera-relative so body rotation induces phantom head motion; image
+  // space is what the viewer perceives as "head moved." 8% of frame = 0/100.
   let xMin = Infinity, xMax = -Infinity;
   let yMin = Infinity, yMax = -Infinity;
-  let zMin = Infinity, zMax = -Infinity;
   let noseSamples = 0;
-  for (let i = 0; i <= impactIdx; i++) {
-    const w = world(frames[i], KP.NOSE);
-    if (!w) continue;
-    if (w[0] < xMin) xMin = w[0]; if (w[0] > xMax) xMax = w[0];
-    if (w[1] < yMin) yMin = w[1]; if (w[1] > yMax) yMax = w[1];
-    if (w[2] < zMin) zMin = w[2]; if (w[2] > zMax) zMax = w[2];
+  for (let i = swingStart; i <= impactIdx; i++) {
+    const n = frames[i] && frames[i][KP.NOSE];
+    if (!n || n.score < 0.3) continue;
+    if (n.x < xMin) xMin = n.x; if (n.x > xMax) xMax = n.x;
+    if (n.y < yMin) yMin = n.y; if (n.y > yMax) yMax = n.y;
     noseSamples++;
   }
-  const headRange3D = noseSamples > 0
-    ? Math.hypot(xMax - xMin, yMax - yMin, zMax - zMin)
-    : 0;
-  const headStability = Math.round((1 - Math.min(1, headRange3D / 0.08)) * 100);
+  const headRange = noseSamples > 0 ? Math.hypot(xMax - xMin, yMax - yMin) : 0;
+  const headStability = Math.round((1 - Math.min(1, headRange / 0.08)) * 100);
 
   // 3D rotations around the spine axis (view-agnostic).
-  const addressF = frames[0];
+  // Rotations: use swingStart frame as "address," not frame 0 (which may be
+  // pre-swing dwell).
+  const addressF = frames[swingStart];
   const topF = frames[topIdx];
   const impactF = frames[impactIdx];
   const shoulderTurnDeg = rotationAroundSpine(addressF, topF, KP.L_SHOULDER, KP.R_SHOULDER);
   const hipTurnDeg = rotationAroundSpine(addressF, impactF, KP.L_HIP, KP.R_HIP);
 
-  const backswingSec = frameTimestamps[topIdx] - frameTimestamps[0];
+  const backswingSec = frameTimestamps[topIdx] - frameTimestamps[swingStart];
   const downswingSec = Math.max(0.01, frameTimestamps[impactIdx] - frameTimestamps[topIdx]);
   const ratio = backswingSec / downswingSec;
   const tempo = ratio > 2.5 && ratio < 3.5 ? 'on-tempo' : ratio < 2.5 ? 'quick' : 'slow';
 
-  const durationMs = Math.round(frameTimestamps[finishIdx] * 1000);
+  const durationMs = Math.round((frameTimestamps[finishIdx] - frameTimestamps[swingStart]) * 1000);
 
   return {
-    keyframes: { topIdx, impactIdx, finishIdx },
+    keyframes: { swingStart, topIdx, impactIdx, finishIdx },
     metrics: {
       headStability,
       shoulderTurnDeg,
@@ -682,6 +724,7 @@ function SkeletonOverlay({ keypoints, width, height }) {
 
 function KeyframeStrip({ keyframes, frameTimestamps, currentFrame, onSeek }) {
   const marks = [
+    { label: 'Address', idx: keyframes.swingStart },
     { label: 'Top', idx: keyframes.topIdx },
     { label: 'Impact', idx: keyframes.impactIdx },
     { label: 'Finish', idx: keyframes.finishIdx },

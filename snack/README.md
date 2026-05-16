@@ -9,7 +9,7 @@ WebView — **no API, no account, no cost.**
 
 Open this URL in your phone browser, then "Open with Expo Go":
 
-> https://snack.expo.dev/CDqSPQTGVUOzuwKtP68v8
+> https://snack.expo.dev/0X2ZJYZwYkqz3HkArsCDX
 
 ## How it works
 
