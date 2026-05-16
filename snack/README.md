@@ -1,28 +1,51 @@
 # CaddyAI on Expo Snack
 
-A single-file build of CaddyAI hosted on [Expo Snack](https://snack.expo.dev/)
-so it can run on a phone via Expo Go without a local dev environment.
+On-device golf swing analysis. Pick a video from your library, get a
+pose-skeleton overlay, swing metrics, and coaching notes. The pose model
+(MediaPipe Pose Landmarker, by Google) runs on-device inside a hidden
+WebView — **no API, no account, no cost.**
 
 ## Run it
 
-Open this URL on a phone (or any browser) and follow the "My Device" /
-QR-code instructions inside Expo Go:
+Open this URL in your phone browser, then "Open with Expo Go":
 
-> https://snack.expo.dev/KI3YUZYddsKE_5dTsSeCV
+> https://snack.expo.dev/0CsBQQEz6ONtRmQYBrzdq
 
-The Snack version is intentionally flattened: one `App.js`, state-based
-navigation between Feed and Log views, but the same SQLite schema and
-feedback heuristic as the full repo. Drills, progress charts, and the
-swing-detail screen are trimmed.
+## How it works
+
+```
+┌──────────────────┐    pick video    ┌───────────────────┐
+│ expo-image-      │ ────────────────▶│ expo-video-       │
+│   picker         │                  │   thumbnails      │ (extract N frames)
+└──────────────────┘                  └─────────┬─────────┘
+                                                │ JPEG data URLs
+                                                ▼
+                                      ┌───────────────────┐
+                                      │ hidden WebView    │
+                                      │ + @mediapipe/     │ (WASM, on-device)
+                                      │   tasks-vision    │
+                                      └─────────┬─────────┘
+                                                │ keypoints[]
+                                                ▼
+                                      ┌───────────────────┐
+                                      │ analyzeKeypoints  │ (metrics + text)
+                                      └─────────┬─────────┘
+                                                ▼
+                                      ┌───────────────────┐
+                                      │ VideoView with    │
+                                      │ react-native-svg  │ (overlay)
+                                      │ overlay           │
+                                      └───────────────────┘
+```
+
+The WebView mounts an HTML page that loads MediaPipe's WASM pose model
+from jsDelivr CDN. We send each extracted frame as a base64 data URL via
+`postMessage`; the model runs in the WebView's JS engine and posts
+keypoints back. The whole pipeline runs on the device — the only network
+traffic is the one-time load of the WASM + model file (~10 MB cached).
 
 ## Re-publishing after edits
 
-The single-file build is `App.js` in this folder. After editing it:
-
 ```bash
-node snack/save.mjs
-# prints { hashId: "..." } — that's the new Snack id
+node snack/save.mjs   # prints the new hashId / URL
 ```
-
-The full repo (multi-file expo-router app) under the project root is
-the source of truth; this folder is a packaging detail for Snack.

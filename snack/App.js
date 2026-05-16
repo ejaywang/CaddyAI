@@ -1,19 +1,23 @@
-// CaddyAI - Snack single-file build
-// Source of truth lives in the multi-file repo; this is a flattened
-// version that fits Snack's single-entrypoint model.
+// CaddyAI - on-device swing analysis (Snack build)
+// Pick a swing video → MediaPipe Pose runs in a hidden WebView (WASM) →
+// skeleton overlay + metrics + coaching text. Everything runs on the
+// device. No API, no account, no cost. Works in Expo Go.
 
 import { StatusBar } from 'expo-status-bar';
-import * as SQLite from 'expo-sqlite';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useVideoPlayer, VideoView } from 'expo-video';
+import * as ImagePicker from 'expo-image-picker';
+import * as VideoThumbnails from 'expo-video-thumbnails';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  FlatList,
+  ActivityIndicator,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from 'react-native';
+import Svg, { Circle, Line, Rect } from 'react-native-svg';
+import { WebView } from 'react-native-webview';
 
 // ---------- theme ----------
 const C = {
@@ -25,448 +29,658 @@ const C = {
   primary: '#4ADE80',
   warn: '#E9A23B',
   bad: '#E5715C',
+  skeleton: '#4ADE80',
+  faceBox: '#E5715C',
 };
 
-// ---------- domain ----------
-const CLUBS = ['Driver','3W','5W','Hybrid','3I','4I','5I','6I','7I','8I','9I','PW','GW','SW','LW','Putter'];
-const OUTCOMES = ['pure','thin','fat','toe','heel','pull','push'];
-const FLIGHTS = ['straight','draw','fade','hook','slice'];
+// ---------- MediaPipe Pose Landmarker: 33 keypoints ----------
+// https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
+const KP = {
+  NOSE: 0,
+  L_EYE_INNER: 1, L_EYE: 2, L_EYE_OUTER: 3,
+  R_EYE_INNER: 4, R_EYE: 5, R_EYE_OUTER: 6,
+  L_EAR: 7, R_EAR: 8,
+  MOUTH_L: 9, MOUTH_R: 10,
+  L_SHOULDER: 11, R_SHOULDER: 12,
+  L_ELBOW: 13, R_ELBOW: 14,
+  L_WRIST: 15, R_WRIST: 16,
+  L_PINKY: 17, R_PINKY: 18,
+  L_INDEX: 19, R_INDEX: 20,
+  L_THUMB: 21, R_THUMB: 22,
+  L_HIP: 23, R_HIP: 24,
+  L_KNEE: 25, R_KNEE: 26,
+  L_ANKLE: 27, R_ANKLE: 28,
+  L_HEEL: 29, R_HEEL: 30,
+  L_FOOT: 31, R_FOOT: 32,
+};
 
-function genId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+const EDGES = [
+  // torso
+  [KP.L_SHOULDER, KP.R_SHOULDER],
+  [KP.L_SHOULDER, KP.L_HIP],
+  [KP.R_SHOULDER, KP.R_HIP],
+  [KP.L_HIP, KP.R_HIP],
+  // arms
+  [KP.L_SHOULDER, KP.L_ELBOW], [KP.L_ELBOW, KP.L_WRIST],
+  [KP.R_SHOULDER, KP.R_ELBOW], [KP.R_ELBOW, KP.R_WRIST],
+  // legs
+  [KP.L_HIP, KP.L_KNEE], [KP.L_KNEE, KP.L_ANKLE],
+  [KP.R_HIP, KP.R_KNEE], [KP.R_KNEE, KP.R_ANKLE],
+];
+
+const FACE_KEYPOINTS = [KP.NOSE, KP.L_EYE, KP.R_EYE, KP.L_EAR, KP.R_EAR];
+
+// ---------- pose-detector WebView HTML ----------
+// Loads MediaPipe Tasks Vision (Pose Landmarker) from jsDelivr CDN and exposes
+// a postMessage protocol: { type: 'frame', id, dataUrl } -> { type: 'result',
+// id, keypoints[] | error }. Stays alive across multiple frame requests.
+
+const DETECTOR_HTML = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>html,body{margin:0;background:#000;color:#fff;font-family:sans-serif;font-size:12px;padding:8px}</style>
+</head><body>
+<div id="status">Loading MediaPipe…</div>
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const statusEl = document.getElementById('status');
+const setStatus = (t) => { try { statusEl.textContent = t; } catch (e) {} };
+
+function post(msg) {
+  const s = JSON.stringify(msg);
+  if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(s);
 }
 
-// ---------- DB ----------
-let _db = null;
-async function db() {
-  if (_db) return _db;
-  _db = await SQLite.openDatabaseAsync('caddyai.db');
-  await _db.execAsync(`
-    PRAGMA journal_mode = WAL;
-    CREATE TABLE IF NOT EXISTS swings (
-      id TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL,
-      club TEXT NOT NULL,
-      outcome TEXT NOT NULL,
-      ball_flight TEXT NOT NULL,
-      self_rating INTEGER NOT NULL,
-      tempo INTEGER NOT NULL,
-      contact INTEGER NOT NULL,
-      carry_distance INTEGER,
-      notes TEXT
+let landmarker = null;
+let initError = null;
+
+async function init() {
+  try {
+    setStatus('Loading WASM…');
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
     );
-    CREATE TABLE IF NOT EXISTS feedback (
-      id TEXT PRIMARY KEY,
-      swing_id TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      source TEXT NOT NULL,
-      text TEXT NOT NULL
-    );
-  `);
-  return _db;
-}
-
-async function insertSwing(s) {
-  const d = await db();
-  const id = genId();
-  const created_at = Date.now();
-  await d.runAsync(
-    `INSERT INTO swings (id, created_at, club, outcome, ball_flight, self_rating, tempo, contact, carry_distance, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, created_at, s.club, s.outcome, s.ball_flight, s.self_rating, s.tempo, s.contact, s.carry_distance, s.notes]
-  );
-  return { id, created_at, ...s };
-}
-
-async function listSwings(limit = 50) {
-  const d = await db();
-  return d.getAllAsync(`SELECT * FROM swings ORDER BY created_at DESC LIMIT ?`, [limit]);
-}
-
-async function recentByClub(club, limit = 10) {
-  const d = await db();
-  return d.getAllAsync(`SELECT * FROM swings WHERE club = ? ORDER BY created_at DESC LIMIT ?`, [club, limit]);
-}
-
-async function listFeedback(swing_id) {
-  const d = await db();
-  return d.getAllAsync(`SELECT * FROM feedback WHERE swing_id = ? ORDER BY created_at`, [swing_id]);
-}
-
-async function insertFeedback(f) {
-  const d = await db();
-  const id = genId();
-  const created_at = Date.now();
-  await d.runAsync(
-    `INSERT INTO feedback (id, swing_id, created_at, source, text) VALUES (?, ?, ?, ?, ?)`,
-    [id, f.swing_id, created_at, f.source, f.text]
-  );
-  return { id, created_at, ...f };
-}
-
-// ---------- feedback engine ----------
-function suggestFeedback(swing, recent) {
-  const out = [];
-  switch (swing.outcome) {
-    case 'thin': out.push('Thin strike — cover the ball with your chest through impact. Drill: towel under armpit.'); break;
-    case 'fat': out.push('Fat strike — shift pressure to your lead side earlier. Drill: feet-together swings.'); break;
-    case 'toe': out.push('Toe strike — stand a touch closer, extend through. Drill: gate drill.'); break;
-    case 'heel': out.push('Heel strike — maintain posture, avoid early extension. Drill: gate drill.'); break;
-    case 'pull': out.push('Pulled it — trail shoulder going out. Drill: gate drill.'); break;
-    case 'push': out.push('Pushed it — check alignment, rotate through. Drill: gate drill.'); break;
+    setStatus('Loading model…');
+    landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+        delegate: "CPU",
+      },
+      runningMode: "IMAGE",
+      numPoses: 1,
+    });
+    setStatus('Ready');
+    post({ type: 'ready' });
+  } catch (e) {
+    initError = String(e);
+    setStatus('Init error: ' + initError);
+    post({ type: 'init_error', error: initError });
   }
-  if (swing.ball_flight === 'slice') out.push('Slice — face open to path. Strengthen lead-hand grip. Drill: split-grip swings.');
-  if (swing.ball_flight === 'hook') out.push('Hook — face closed at impact. Hold off rotation. Drill: split-grip swings.');
-  if (swing.ball_flight === 'straight') out.push('Straight flight — face and path matched. Bottle this grip pressure.');
-  if (swing.contact <= 2) out.push('Contact felt off — steady head, centered strike. Drill: towel under armpit.');
-  if (swing.tempo <= 2) out.push('Tempo rushed — slow the transition, let the club fall. Drill: pause at the top.');
+}
 
-  const sameClub = recent.filter((r) => r.id !== swing.id && r.club === swing.club);
-  if (sameClub.length >= 3) {
-    const last3 = sameClub.slice(0, 3);
-    const repeated = last3.every((r) => r.ball_flight === swing.ball_flight) && swing.ball_flight !== 'straight';
-    const avg = last3.reduce((a, b) => a + b.self_rating, 0) / 3;
-    if (repeated) {
-      out.push(`${swing.ball_flight.toUpperCase()} shape is repeating with your ${swing.club}. Own it or do a path/face drill.`);
-    } else if (avg < 2.5) {
-      out.push(`Last few ${swing.club} swings rough. Step off, reset breathing, half-swing restart.`);
+async function processFrame(id, dataUrl) {
+  if (!landmarker) {
+    post({ type: 'result', id, error: 'not_ready' });
+    return;
+  }
+  try {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = dataUrl; });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const result = landmarker.detect(canvas);
+    const lm = (result.landmarks && result.landmarks[0]) || [];
+    const keypoints = lm.map((p) => ({
+      x: p.x, y: p.y, score: p.visibility != null ? p.visibility : 1,
+    }));
+    post({ type: 'result', id, keypoints });
+  } catch (e) {
+    post({ type: 'result', id, error: String(e) });
+  }
+}
+
+function handle(raw) {
+  try {
+    const msg = JSON.parse(raw);
+    if (msg.type === 'frame') processFrame(msg.id, msg.dataUrl);
+  } catch (e) {}
+}
+window.addEventListener('message', (e) => handle(e.data));
+document.addEventListener('message', (e) => handle(e.data));
+
+init();
+</script></body></html>
+`;
+
+// ---------- analysis (metrics + text from keypoint timeline) ----------
+function analyzeKeypoints(frames, fps) {
+  let topIdx = 0;
+  let minY = 1;
+  for (let i = 0; i < frames.length; i++) {
+    const rw = frames[i] && frames[i][KP.R_WRIST];
+    if (rw && rw.score > 0.3 && rw.y < minY) {
+      minY = rw.y;
+      topIdx = i;
     }
   }
-  if (swing.self_rating >= 4 && swing.contact >= 4 && swing.tempo >= 4) {
-    out.push('Great swing — replay it mentally before the next one.');
+  let impactIdx = topIdx;
+  let bestDist = 1;
+  for (let i = topIdx; i < frames.length; i++) {
+    const f = frames[i];
+    if (!f) continue;
+    const lw = f[KP.L_WRIST], rw = f[KP.R_WRIST];
+    if (!lw || !rw) continue;
+    const hy = (lw.y + rw.y) / 2;
+    // estimate address from frame 0
+    const f0 = frames[0];
+    if (!f0) continue;
+    const addressY = (f0[KP.L_WRIST].y + f0[KP.R_WRIST].y) / 2;
+    const d = Math.abs(hy - addressY);
+    if (d < bestDist) {
+      bestDist = d;
+      impactIdx = i;
+    }
   }
-  return [...new Set(out)];
+  const finishIdx = frames.length - 1;
+
+  let noseXMin = 1, noseXMax = 0, noseYMin = 1, noseYMax = 0;
+  let noseSamples = 0;
+  for (let i = 0; i <= impactIdx; i++) {
+    const n = frames[i] && frames[i][KP.NOSE];
+    if (!n || n.score < 0.3) continue;
+    noseXMin = Math.min(noseXMin, n.x);
+    noseXMax = Math.max(noseXMax, n.x);
+    noseYMin = Math.min(noseYMin, n.y);
+    noseYMax = Math.max(noseYMax, n.y);
+    noseSamples++;
+  }
+  const headRange = noseSamples > 0
+    ? Math.hypot(noseXMax - noseXMin, noseYMax - noseYMin)
+    : 0;
+  const headStability = Math.round((1 - Math.min(1, headRange / 0.08)) * 100);
+
+  const topF = frames[topIdx];
+  const shoulderTurnDeg = topF && topF[KP.L_SHOULDER] && topF[KP.R_SHOULDER]
+    ? Math.round(Math.abs(Math.atan2(
+        topF[KP.R_SHOULDER].y - topF[KP.L_SHOULDER].y,
+        topF[KP.R_SHOULDER].x - topF[KP.L_SHOULDER].x
+      ) * 180 / Math.PI))
+    : 0;
+
+  const impactF = frames[impactIdx];
+  const hipTurnDeg = impactF && impactF[KP.L_HIP] && impactF[KP.R_HIP]
+    ? Math.round(Math.abs(Math.atan2(
+        impactF[KP.R_HIP].y - impactF[KP.L_HIP].y,
+        impactF[KP.R_HIP].x - impactF[KP.L_HIP].x
+      ) * 180 / Math.PI))
+    : 0;
+
+  const backswingFrames = topIdx;
+  const downswingFrames = Math.max(1, impactIdx - topIdx);
+  const ratio = backswingFrames / downswingFrames;
+  const tempo = ratio > 2.5 && ratio < 3.5 ? 'on-tempo' : ratio < 2.5 ? 'quick' : 'slow';
+
+  const durationMs = Math.round((finishIdx / fps) * 1000);
+
+  return {
+    keyframes: { topIdx, impactIdx, finishIdx },
+    metrics: {
+      headStability,
+      shoulderTurnDeg,
+      hipTurnDeg,
+      tempo,
+      tempoRatio: Number(ratio.toFixed(2)),
+      durationMs,
+    },
+    insights: buildInsights({ headStability, shoulderTurnDeg, hipTurnDeg, tempo, ratio }),
+  };
 }
 
-// ---------- UI helpers ----------
-function Chip({ label, selected, onPress, tone = 'default' }) {
-  const c = tone === 'good' ? C.primary : tone === 'bad' ? C.bad : tone === 'warn' ? C.warn : C.primary;
-  return (
-    <Pressable
-      onPress={onPress}
-      style={[
-        styles.chip,
-        {
-          borderColor: selected ? c : C.border,
-          backgroundColor: selected ? c + '22' : C.surface,
-        },
-      ]}
-    >
-      <Text style={{ color: selected ? c : C.text, fontSize: 13 }}>{label}</Text>
-    </Pressable>
-  );
+function buildInsights({ headStability, shoulderTurnDeg, hipTurnDeg, tempo, ratio }) {
+  const out = [];
+  if (headStability >= 80) out.push(`Head stayed steady through impact (${headStability}/100) — keep it.`);
+  else if (headStability >= 60) out.push(`Some head drift (${headStability}/100). Pick a spot on the ball and keep eyes on it through impact.`);
+  else out.push(`Head moved a lot (${headStability}/100). Try the "eyes on a spot" drill — fixed gaze for the full swing.`);
+
+  if (shoulderTurnDeg > 0 && shoulderTurnDeg < 10) out.push(`Shoulder turn looks shallow (${shoulderTurnDeg}°). Lead shoulder under the chin at the top.`);
+  else if (shoulderTurnDeg > 0) out.push(`Shoulder turn ~${shoulderTurnDeg}° — solid coil.`);
+
+  if (hipTurnDeg > 0 && hipTurnDeg < 5) out.push(`Hips not clearing through impact. Drill: feel the lead hip working back and around.`);
+  else if (hipTurnDeg > 0) out.push(`Hips opening ~${hipTurnDeg}° at impact — body leading the club through.`);
+
+  if (isFinite(ratio) && ratio > 0) {
+    if (tempo === 'on-tempo') out.push(`Tempo ${ratio.toFixed(2)}:1 — near pro 3:1 ratio.`);
+    else if (tempo === 'quick') out.push(`Tempo is quick (${ratio.toFixed(2)}:1, pros sit ~3:1). Pause at the top.`);
+    else out.push(`Tempo is slow (${ratio.toFixed(2)}:1, pros sit ~3:1). Let the club fall — don't steer.`);
+  }
+  return out;
 }
 
-function Stars({ value, onChange, label }) {
-  return (
-    <View style={styles.starsRow}>
-      <Text style={{ color: C.dim, fontSize: 13 }}>{label}</Text>
-      <View style={{ flexDirection: 'row', gap: 8 }}>
-        {[1, 2, 3, 4, 5].map((n) => (
-          <Pressable key={n} onPress={() => onChange(n)} hitSlop={8}>
-            <View
-              style={{
-                width: 22, height: 22, borderRadius: 11, borderWidth: 2,
-                borderColor: n <= value ? C.primary : C.border,
-                backgroundColor: n <= value ? C.primary : 'transparent',
-              }}
-            />
-          </Pressable>
-        ))}
-      </View>
-    </View>
-  );
-}
+// ---------- the WebView-backed pose runner ----------
 
-// ---------- app ----------
-export default function App() {
-  const [tab, setTab] = useState('feed');
-  const [swings, setSwings] = useState([]);
-  const [expanded, setExpanded] = useState(null);
-  const [expandedFb, setExpandedFb] = useState([]);
+function usePoseRunner() {
+  const webRef = useRef(null);
+  const pendingRef = useRef(new Map());
+  const idRef = useRef(0);
   const [ready, setReady] = useState(false);
+  const [error, setError] = useState(null);
 
-  const refresh = useCallback(async () => {
-    const rows = await listSwings(100);
-    setSwings(rows);
+  const onMessage = useCallback((event) => {
+    let msg;
+    try { msg = JSON.parse(event.nativeEvent.data); } catch { return; }
+    if (msg.type === 'ready') setReady(true);
+    else if (msg.type === 'init_error') setError(msg.error || 'init failed');
+    else if (msg.type === 'result') {
+      const cb = pendingRef.current.get(msg.id);
+      if (cb) {
+        pendingRef.current.delete(msg.id);
+        cb(msg);
+      }
+    }
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      await db();
-      await refresh();
-      setReady(true);
-    })();
-  }, [refresh]);
+  const detect = useCallback((dataUrl) => {
+    return new Promise((resolve, reject) => {
+      if (!webRef.current) return reject(new Error('detector not mounted'));
+      const id = String(++idRef.current);
+      pendingRef.current.set(id, (m) => {
+        if (m.error) reject(new Error(m.error));
+        else resolve(m.keypoints);
+      });
+      const payload = JSON.stringify({ type: 'frame', id, dataUrl });
+      webRef.current.postMessage(payload);
+      // safety timeout
+      setTimeout(() => {
+        if (pendingRef.current.has(id)) {
+          pendingRef.current.delete(id);
+          reject(new Error('detect timeout'));
+        }
+      }, 15000);
+    });
+  }, []);
 
-  const onSaved = async () => {
-    await refresh();
-    setTab('feed');
-  };
+  const node = (
+    <View style={styles.hiddenWeb} pointerEvents="none">
+      <WebView
+        ref={webRef}
+        source={{ html: DETECTOR_HTML }}
+        onMessage={onMessage}
+        originWhitelist={['*']}
+        javaScriptEnabled
+        domStorageEnabled
+        mixedContentMode="always"
+        allowFileAccess
+        allowUniversalAccessFromFileURLs
+        style={{ flex: 1, backgroundColor: '#000' }}
+      />
+    </View>
+  );
 
-  const openSwing = async (s) => {
-    if (expanded === s.id) {
-      setExpanded(null);
-      setExpandedFb([]);
+  return { node, ready, error, detect };
+}
+
+// ---------- App ----------
+export default function App() {
+  const runner = usePoseRunner();
+  const [stage, setStage] = useState('home');
+  const [videoUri, setVideoUri] = useState(null);
+  const [progress, setProgress] = useState({ done: 0, total: 0, label: '' });
+  const [analysis, setAnalysis] = useState(null);
+  const [error, setError] = useState(null);
+
+  const pickAndAnalyze = useCallback(async () => {
+    setError(null);
+    if (!runner.ready) {
+      setError('Pose detector still loading. Try again in a moment.');
       return;
     }
-    setExpanded(s.id);
-    setExpandedFb(await listFeedback(s.id));
-  };
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) {
+      setError('Need photo library access.');
+      return;
+    }
+    const res = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['videos'],
+      allowsEditing: false,
+      quality: 1,
+    });
+    if (res.canceled) return;
+    const asset = res.assets[0];
+    setVideoUri(asset.uri);
+    setStage('analyzing');
 
-  if (!ready) {
-    return <View style={styles.loading}><StatusBar style="light" /></View>;
-  }
+    try {
+      const durationMs = asset.duration || 3000;
+      const fps = 10; // sample at 10 fps; balance between detail and speed
+      const numFrames = Math.max(15, Math.min(60, Math.round((durationMs / 1000) * fps)));
+      const stepMs = durationMs / (numFrames - 1);
+
+      const frames = new Array(numFrames).fill(null);
+
+      for (let i = 0; i < numFrames; i++) {
+        setProgress({ done: i, total: numFrames, label: 'Extracting frame' });
+        const timeMs = Math.round(i * stepMs);
+        const { uri: thumbUri } = await VideoThumbnails.getThumbnailAsync(asset.uri, {
+          time: timeMs,
+          quality: 0.5,
+        });
+        const dataUrl = await uriToDataUrl(thumbUri);
+        setProgress({ done: i, total: numFrames, label: 'Detecting pose' });
+        const keypoints = await runner.detect(dataUrl).catch(() => null);
+        frames[i] = keypoints;
+      }
+
+      setProgress({ done: numFrames, total: numFrames, label: 'Computing metrics' });
+      // remove nulls / empty frames before analysis
+      const dense = frames.map((f) => (f && f.length ? f : null));
+      // fill nulls by carrying forward last valid frame (so timeline is contiguous)
+      let last = null;
+      for (let i = 0; i < dense.length; i++) {
+        if (dense[i]) last = dense[i];
+        else if (last) dense[i] = last;
+      }
+      if (!dense.some(Boolean)) {
+        throw new Error('No pose detected in this video. Try a clearer full-body swing video.');
+      }
+
+      const summary = analyzeKeypoints(dense, fps);
+      setAnalysis({ frames: dense, fps, ...summary });
+      setStage('result');
+    } catch (e) {
+      setError(String(e.message || e));
+      setStage('home');
+    }
+  }, [runner]);
+
+  const reset = () => {
+    setStage('home');
+    setVideoUri(null);
+    setAnalysis(null);
+    setError(null);
+    setProgress({ done: 0, total: 0, label: '' });
+  };
 
   return (
     <View style={styles.app}>
       <StatusBar style="light" />
-      <View style={styles.header}>
-        <Text style={styles.title}>CaddyAI</Text>
-        <View style={styles.tabs}>
-          <TabBtn label="Feed" active={tab === 'feed'} onPress={() => setTab('feed')} />
-          <TabBtn label="Log" active={tab === 'log'} onPress={() => setTab('log')} />
-        </View>
-      </View>
-      {tab === 'feed' ? (
-        <FeedView swings={swings} expanded={expanded} expandedFb={expandedFb} onOpen={openSwing} />
-      ) : (
-        <LogView onSaved={onSaved} />
+      {runner.node}
+      {stage === 'home' && (
+        <HomeScreen
+          onPick={pickAndAnalyze}
+          ready={runner.ready}
+          runnerError={runner.error}
+          error={error}
+        />
+      )}
+      {stage === 'analyzing' && <AnalyzingScreen progress={progress} />}
+      {stage === 'result' && analysis && (
+        <ResultScreen videoUri={videoUri} analysis={analysis} onReset={reset} />
       )}
     </View>
   );
 }
 
-function TabBtn({ label, active, onPress }) {
+async function uriToDataUrl(uri) {
+  // expo-video-thumbnails returns a file:// URI. Convert to base64 data URL
+  // via fetch (works in Expo Go for file URIs).
+  const res = await fetch(uri);
+  const blob = await res.blob();
+  return await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onloadend = () => resolve(r.result);
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+// ---------- screens ----------
+function HomeScreen({ onPick, ready, runnerError, error }) {
   return (
-    <Pressable onPress={onPress} style={[styles.tabBtn, active && styles.tabBtnActive]}>
-      <Text style={{ color: active ? '#03130B' : C.dim, fontWeight: '600' }}>{label}</Text>
-    </Pressable>
+    <View style={styles.center}>
+      <Text style={styles.brand}>CaddyAI</Text>
+      <Text style={styles.tagline}>Swing analysis with on-device pose tracking</Text>
+
+      <Pressable onPress={onPick} disabled={!ready} style={[styles.cta, !ready && { opacity: 0.5 }]}>
+        <Text style={styles.ctaText}>{ready ? 'Pick a swing video' : 'Loading pose model…'}</Text>
+      </Pressable>
+
+      <Text style={styles.hint}>
+        Choose a video of a full swing from your camera roll. Best results: face-on,
+        full body in frame, 2–5 seconds long.
+      </Text>
+
+      {runnerError ? <Text style={styles.error}>Pose model error: {runnerError}</Text> : null}
+      {error ? <Text style={styles.error}>{error}</Text> : null}
+
+      <Text style={styles.footer}>
+        Pose detection: MediaPipe (Google) running on-device in WebView.
+        No API, no account, no cost.
+      </Text>
+    </View>
   );
 }
 
-function FeedView({ swings, expanded, expandedFb, onOpen }) {
-  const today = swings.filter((s) => isToday(s.created_at));
-  const pure = today.filter((s) => s.outcome === 'pure').length;
-  const pureRate = today.length ? Math.round((pure / today.length) * 100) : 0;
-  const avgQ = today.length ? (today.reduce((a, b) => a + b.self_rating, 0) / today.length).toFixed(1) : '—';
-
+function AnalyzingScreen({ progress }) {
+  const pct = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
   return (
-    <FlatList
-      data={swings}
-      keyExtractor={(s) => s.id}
-      contentContainerStyle={{ padding: 16, paddingBottom: 60 }}
-      ListHeaderComponent={
-        <View>
-          <Text style={styles.subtitle}>{today.length} swing{today.length === 1 ? '' : 's'} today</Text>
-          <View style={styles.statsRow}>
-            <Tile label="Quality" value={String(avgQ)} hint="today /5" />
-            <Tile label="Pure rate" value={today.length ? pureRate + '%' : '—'} hint={today.length ? pure + '/' + today.length : 'no data'} />
-          </View>
-          <Text style={styles.section}>Recent swings</Text>
-        </View>
-      }
-      ListEmptyComponent={
-        <View style={styles.empty}>
-          <Text style={{ color: C.text, fontWeight: '600' }}>No swings yet.</Text>
-          <Text style={{ color: C.dim, marginTop: 8 }}>Tap “Log” to record your first one. The feedback engine will give you a practice cue.</Text>
-        </View>
-      }
-      renderItem={({ item }) => (
-        <SwingItem swing={item} expanded={expanded === item.id} feedback={expanded === item.id ? expandedFb : []} onPress={() => onOpen(item)} />
-      )}
-    />
+    <View style={styles.center}>
+      <ActivityIndicator size="large" color={C.primary} />
+      <Text style={[styles.brand, { marginTop: 24, fontSize: 18 }]}>
+        {progress.label || 'Analyzing…'}
+      </Text>
+      <View style={styles.progressBar}>
+        <View style={[styles.progressFill, { width: `${pct}%` }]} />
+      </View>
+      <Text style={{ color: C.dim, marginTop: 12, fontSize: 13 }}>
+        {progress.done}/{progress.total} frames
+      </Text>
+    </View>
   );
 }
 
-function SwingItem({ swing, expanded, feedback, onPress }) {
-  const flightTone = ['straight','draw','fade'].includes(swing.ball_flight) ? C.primary : C.warn;
-  const outcomeTone = swing.outcome === 'pure' ? C.primary : C.warn;
-  return (
-    <Pressable onPress={onPress} style={styles.card}>
-      <View style={styles.cardHeader}>
-        <Text style={styles.club}>{swing.club}</Text>
-        <Text style={{ color: C.dim, fontSize: 12 }}>{formatTime(swing.created_at)}</Text>
-      </View>
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginBottom: 12 }}>
-        <Tag label={swing.outcome.toUpperCase()} color={outcomeTone} />
-        <Tag label={swing.ball_flight.toUpperCase()} color={flightTone} />
-        {swing.carry_distance ? <Tag label={swing.carry_distance + 'y'} color={C.dim} /> : null}
-      </View>
-      <View style={{ flexDirection: 'row' }}>
-        <Metric label="Quality" value={swing.self_rating} />
-        <Metric label="Contact" value={swing.contact} />
-        <Metric label="Tempo" value={swing.tempo} />
-      </View>
-      {swing.notes ? <Text style={styles.notes}>{swing.notes}</Text> : null}
-      {expanded ? (
-        <View style={styles.fbBox}>
-          {feedback.length === 0 ? (
-            <Text style={{ color: C.dim, fontStyle: 'italic' }}>No feedback yet.</Text>
-          ) : feedback.map((f) => (
-            <View key={f.id} style={styles.fbItem}>
-              <Text style={{ color: C.primary, fontSize: 11, fontWeight: '700', marginBottom: 4 }}>{f.source.toUpperCase()}</Text>
-              <Text style={{ color: C.text, fontSize: 13, lineHeight: 18 }}>{f.text}</Text>
-            </View>
-          ))}
-        </View>
-      ) : null}
-    </Pressable>
-  );
-}
+function ResultScreen({ videoUri, analysis, onReset }) {
+  const player = useVideoPlayer(videoUri, (p) => { p.loop = true; p.play(); });
+  const [currentTime, setCurrentTime] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const [size, setSize] = useState({ width: 0, height: 0 });
 
-function LogView({ onSaved }) {
-  const [club, setClub] = useState('7I');
-  const [outcome, setOutcome] = useState('pure');
-  const [flight, setFlight] = useState('straight');
-  const [quality, setQuality] = useState(3);
-  const [contact, setContact] = useState(3);
-  const [tempo, setTempo] = useState(3);
-  const [carry, setCarry] = useState('');
-  const [notes, setNotes] = useState('');
-  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    const id = setInterval(() => {
+      try { setCurrentTime(player.currentTime || 0); } catch (e) {}
+    }, 50);
+    return () => clearInterval(id);
+  }, [player]);
 
-  const save = async () => {
-    if (saving) return;
-    setSaving(true);
-    try {
-      const swing = await insertSwing({
-        club, outcome, ball_flight: flight,
-        self_rating: quality, contact, tempo,
-        carry_distance: carry ? parseInt(carry, 10) : null,
-        notes: notes.trim() || null,
-      });
-      const recent = await recentByClub(club, 10);
-      const fb = suggestFeedback(swing, recent);
-      for (const t of fb) {
-        await insertFeedback({ swing_id: swing.id, source: 'auto', text: t });
-      }
-      setQuality(3); setContact(3); setTempo(3); setCarry(''); setNotes('');
-      onSaved();
-    } finally {
-      setSaving(false);
-    }
+  const togglePlay = () => {
+    if (paused) { player.play(); setPaused(false); }
+    else { player.pause(); setPaused(true); }
   };
 
+  const totalSec = analysis.frames.length / analysis.fps;
+  const t = totalSec > 0 ? Math.min(1, currentTime / totalSec) : 0;
+  const frameIdx = Math.min(analysis.frames.length - 1, Math.floor(t * analysis.frames.length));
+  const currentKeypoints = analysis.frames[frameIdx];
+
   return (
-    <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 80 }} keyboardShouldPersistTaps="handled">
-      <Field label="Club">
-        <Row>{CLUBS.map((c) => <Chip key={c} label={c} selected={club === c} onPress={() => setClub(c)} />)}</Row>
-      </Field>
-      <Field label="Strike">
-        <Row>{OUTCOMES.map((o) => <Chip key={o} label={o} selected={outcome === o} tone={o === 'pure' ? 'good' : 'warn'} onPress={() => setOutcome(o)} />)}</Row>
-      </Field>
-      <Field label="Ball flight">
-        <Row>{FLIGHTS.map((f) => <Chip key={f} label={f} selected={flight === f} tone={f === 'hook' || f === 'slice' ? 'bad' : 'good'} onPress={() => setFlight(f)} />)}</Row>
-      </Field>
-      <Field label="Ratings">
-        <View style={{ backgroundColor: C.surface, borderRadius: 16, borderWidth: 1, borderColor: C.border, paddingHorizontal: 16 }}>
-          <Stars label="Quality" value={quality} onChange={setQuality} />
-          <Stars label="Contact" value={contact} onChange={setContact} />
-          <Stars label="Tempo" value={tempo} onChange={setTempo} />
-        </View>
-      </Field>
-      <Field label="Carry distance (yards)">
-        <TextInput
-          keyboardType="number-pad"
-          value={carry}
-          onChangeText={(v) => setCarry(v.replace(/[^0-9]/g, ''))}
-          placeholder="—"
-          placeholderTextColor={C.dim}
-          style={styles.input}
-        />
-      </Field>
-      <Field label="Notes">
-        <TextInput
-          value={notes}
-          onChangeText={setNotes}
-          multiline
-          placeholder="What did you feel?"
-          placeholderTextColor={C.dim}
-          style={[styles.input, { minHeight: 90, textAlignVertical: 'top' }]}
-        />
-      </Field>
-      <Pressable onPress={save} disabled={saving} style={[styles.saveBtn, saving && { opacity: 0.6 }]}>
-        <Text style={{ color: '#03130B', fontWeight: '700', fontSize: 15 }}>{saving ? 'Saving…' : 'Save swing'}</Text>
+    <ScrollView contentContainerStyle={{ paddingBottom: 60 }}>
+      <View style={styles.header}>
+        <Pressable onPress={onReset} hitSlop={8}><Text style={styles.back}>‹ New swing</Text></Pressable>
+        <Text style={styles.headerTitle}>Analysis</Text>
+        <View style={{ width: 80 }} />
+      </View>
+
+      <Pressable
+        onPress={togglePlay}
+        onLayout={(e) => setSize(e.nativeEvent.layout)}
+        style={styles.videoFrame}
+      >
+        <VideoView player={player} style={StyleSheet.absoluteFill} contentFit="contain" nativeControls={false} />
+        <SkeletonOverlay keypoints={currentKeypoints} width={size.width} height={size.height} />
+        {paused ? (
+          <View style={styles.playBadge}><Text style={{ color: C.text, fontWeight: '700' }}>▶</Text></View>
+        ) : null}
       </Pressable>
+
+      <KeyframeStrip
+        keyframes={analysis.keyframes}
+        fps={analysis.fps}
+        currentFrame={frameIdx}
+        onSeek={(idx) => { try { player.currentTime = idx / analysis.fps; } catch (e) {} }}
+      />
+
+      <View style={styles.metricsRow}>
+        <Tile
+          label="Head stability"
+          value={`${analysis.metrics.headStability}`}
+          hint="/ 100"
+          tone={analysis.metrics.headStability >= 80 ? 'good' : 'warn'}
+        />
+        <Tile
+          label="Tempo"
+          value={`${analysis.metrics.tempoRatio}:1`}
+          hint={analysis.metrics.tempo}
+          tone={analysis.metrics.tempo === 'on-tempo' ? 'good' : 'warn'}
+        />
+      </View>
+      <View style={styles.metricsRow}>
+        <Tile label="Shoulder turn" value={`${analysis.metrics.shoulderTurnDeg}°`} hint="at top" />
+        <Tile label="Hip turn" value={`${analysis.metrics.hipTurnDeg}°`} hint="at impact" />
+      </View>
+
+      <View style={styles.insightsSection}>
+        <Text style={styles.sectionTitle}>Coach notes</Text>
+        {analysis.insights.map((insight, i) => (
+          <View key={i} style={styles.insightCard}>
+            <Text style={styles.insightText}>{insight}</Text>
+          </View>
+        ))}
+      </View>
     </ScrollView>
   );
 }
 
-function Field({ label, children }) {
+function SkeletonOverlay({ keypoints, width, height }) {
+  if (!keypoints || !width || !height) return null;
+  const px = (x) => x * width;
+  const py = (y) => y * height;
+
+  const faceXs = FACE_KEYPOINTS.map((i) => keypoints[i]?.x).filter((v) => typeof v === 'number');
+  const faceYs = FACE_KEYPOINTS.map((i) => keypoints[i]?.y).filter((v) => typeof v === 'number');
+  let faceBox = null;
+  if (faceXs.length > 0) {
+    const fx = Math.min(...faceXs) * width - 6;
+    const fy = Math.min(...faceYs) * height - 10;
+    const fw = (Math.max(...faceXs) - Math.min(...faceXs)) * width + 12;
+    const fh = (Math.max(...faceYs) - Math.min(...faceYs)) * height + 16;
+    faceBox = { fx, fy, fw, fh };
+  }
+
   return (
-    <View style={{ marginBottom: 16 }}>
-      <Text style={styles.fieldLabel}>{label}</Text>
-      {children}
+    <Svg width={width} height={height} style={StyleSheet.absoluteFill} pointerEvents="none">
+      {EDGES.map(([a, b], i) => {
+        const ka = keypoints[a], kb = keypoints[b];
+        if (!ka || !kb || ka.score < 0.3 || kb.score < 0.3) return null;
+        return (
+          <Line key={i} x1={px(ka.x)} y1={py(ka.y)} x2={px(kb.x)} y2={py(kb.y)}
+                stroke={C.skeleton} strokeWidth={3} strokeLinecap="round" />
+        );
+      })}
+      {keypoints.map((kp, i) => {
+        if (!kp || kp.score < 0.3) return null;
+        if (i <= KP.MOUTH_R) return null; // skip face dots, we draw a box
+        if (i > KP.R_ANKLE) return null;   // skip foot details (cleaner overlay)
+        return (
+          <Circle key={i} cx={px(kp.x)} cy={py(kp.y)} r={4}
+                  fill="#fff" stroke={C.skeleton} strokeWidth={2} />
+        );
+      })}
+      {faceBox ? (
+        <Rect x={faceBox.fx} y={faceBox.fy} width={faceBox.fw} height={faceBox.fh}
+              stroke={C.faceBox} strokeWidth={2.5} fill="none" />
+      ) : null}
+    </Svg>
+  );
+}
+
+function KeyframeStrip({ keyframes, fps, currentFrame, onSeek }) {
+  const marks = [
+    { label: 'Top', idx: keyframes.topIdx },
+    { label: 'Impact', idx: keyframes.impactIdx },
+    { label: 'Finish', idx: keyframes.finishIdx },
+  ];
+  return (
+    <View style={styles.keyframeStrip}>
+      {marks.map((m) => (
+        <Pressable
+          key={m.label}
+          onPress={() => onSeek(m.idx)}
+          style={[styles.keyframeBtn, Math.abs(currentFrame - m.idx) < 2 && styles.keyframeBtnActive]}
+        >
+          <Text style={styles.keyframeBtnText}>{m.label}</Text>
+          <Text style={styles.keyframeBtnTime}>{(m.idx / fps).toFixed(2)}s</Text>
+        </Pressable>
+      ))}
     </View>
   );
 }
 
-function Row({ children }) {
-  return <View style={{ flexDirection: 'row', flexWrap: 'wrap' }}>{children}</View>;
-}
-
-function Tile({ label, value, hint }) {
+function Tile({ label, value, hint, tone = 'default' }) {
+  const color = tone === 'good' ? C.primary : tone === 'warn' ? C.warn : C.text;
   return (
     <View style={styles.tile}>
-      <Text style={{ color: C.dim, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.6 }}>{label}</Text>
-      <Text style={{ color: C.text, fontSize: 24, fontWeight: '700', marginTop: 8 }}>{value}</Text>
-      <Text style={{ color: C.dim, fontSize: 11, marginTop: 4 }}>{hint}</Text>
+      <Text style={styles.tileLabel}>{label}</Text>
+      <Text style={[styles.tileValue, { color }]}>{value}</Text>
+      <Text style={styles.tileHint}>{hint}</Text>
     </View>
   );
-}
-
-function Tag({ label, color }) {
-  return (
-    <View style={{ paddingVertical: 3, paddingHorizontal: 8, borderRadius: 6, borderWidth: 1, borderColor: color + '66', backgroundColor: color + '14', marginRight: 8 }}>
-      <Text style={{ color, fontSize: 11, fontWeight: '700', letterSpacing: 0.5 }}>{label}</Text>
-    </View>
-  );
-}
-
-function Metric({ label, value }) {
-  return (
-    <View style={{ flex: 1, alignItems: 'center' }}>
-      <Text style={{ color: C.text, fontSize: 16, fontWeight: '700' }}>{value}/5</Text>
-      <Text style={{ color: C.dim, fontSize: 11, marginTop: 2 }}>{label}</Text>
-    </View>
-  );
-}
-
-function isToday(ts) {
-  const d = new Date(ts), now = new Date();
-  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
-}
-
-function formatTime(ts) {
-  const d = new Date(ts);
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
 }
 
 const styles = StyleSheet.create({
   app: { flex: 1, backgroundColor: C.bg, paddingTop: 50 },
-  loading: { flex: 1, backgroundColor: C.bg },
-  header: { paddingHorizontal: 16, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: C.border },
-  title: { color: C.text, fontSize: 24, fontWeight: '700' },
-  tabs: { flexDirection: 'row', marginTop: 12, gap: 8 },
-  tabBtn: { paddingVertical: 8, paddingHorizontal: 18, borderRadius: 999, borderWidth: 1, borderColor: C.border, backgroundColor: C.surface },
-  tabBtnActive: { backgroundColor: C.primary, borderColor: C.primary },
-  subtitle: { color: C.dim, marginBottom: 16 },
-  statsRow: { flexDirection: 'row', gap: 12, marginBottom: 24 },
-  tile: { flex: 1, backgroundColor: C.surface, borderRadius: 16, borderWidth: 1, borderColor: C.border, padding: 16 },
-  section: { color: C.dim, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 12 },
-  empty: { backgroundColor: C.surface, borderRadius: 16, borderWidth: 1, borderColor: C.border, padding: 24 },
-  card: { backgroundColor: C.surface, borderRadius: 16, borderWidth: 1, borderColor: C.border, padding: 16, marginBottom: 12 },
-  cardHeader: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 },
-  club: { color: C.text, fontSize: 18, fontWeight: '700' },
-  notes: { color: C.dim, fontSize: 13, marginTop: 12, fontStyle: 'italic' },
-  fbBox: { marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.border },
-  fbItem: { backgroundColor: C.bg, borderRadius: 8, padding: 12, marginBottom: 8 },
-  fieldLabel: { color: C.dim, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 8 },
-  chip: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 999, borderWidth: 1, marginRight: 8, marginBottom: 8 },
-  starsRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8 },
-  input: { backgroundColor: C.surface, borderRadius: 10, borderWidth: 1, borderColor: C.border, color: C.text, padding: 12, fontSize: 14 },
-  saveBtn: { backgroundColor: C.primary, borderRadius: 10, paddingVertical: 14, alignItems: 'center', marginTop: 8 },
+  hiddenWeb: { position: 'absolute', width: 1, height: 1, opacity: 0, left: -10, top: -10 },
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32 },
+  brand: { color: C.text, fontSize: 32, fontWeight: '700', letterSpacing: 0.5 },
+  tagline: { color: C.dim, fontSize: 14, marginTop: 8, textAlign: 'center' },
+  cta: { marginTop: 36, backgroundColor: C.primary, paddingVertical: 14, paddingHorizontal: 32, borderRadius: 12 },
+  ctaText: { color: '#03130B', fontSize: 16, fontWeight: '700' },
+  hint: { color: C.dim, fontSize: 13, marginTop: 24, textAlign: 'center', lineHeight: 18 },
+  footer: { color: C.dim, fontSize: 11, marginTop: 40, textAlign: 'center', lineHeight: 16, fontStyle: 'italic' },
+  error: { color: C.bad, marginTop: 16, fontSize: 13, textAlign: 'center' },
+  progressBar: {
+    marginTop: 16, width: 200, height: 6, borderRadius: 3,
+    backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, overflow: 'hidden',
+  },
+  progressFill: { height: '100%', backgroundColor: C.primary },
+  header: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingBottom: 12,
+  },
+  back: { color: C.primary, fontSize: 15, fontWeight: '600' },
+  headerTitle: { color: C.text, fontSize: 17, fontWeight: '700' },
+  videoFrame: { width: '100%', aspectRatio: 9 / 16, backgroundColor: '#000', position: 'relative' },
+  playBadge: {
+    position: 'absolute', top: '45%', left: '45%', width: 44, height: 44, borderRadius: 22,
+    backgroundColor: '#00000066', alignItems: 'center', justifyContent: 'center',
+  },
+  keyframeStrip: { flexDirection: 'row', paddingHorizontal: 12, paddingVertical: 12, gap: 8, backgroundColor: C.surface },
+  keyframeBtn: {
+    flex: 1, paddingVertical: 8, paddingHorizontal: 8, borderRadius: 8,
+    borderWidth: 1, borderColor: C.border, backgroundColor: C.bg, alignItems: 'center',
+  },
+  keyframeBtnActive: { borderColor: C.primary, backgroundColor: C.primary + '22' },
+  keyframeBtnText: { color: C.text, fontSize: 12, fontWeight: '700' },
+  keyframeBtnTime: { color: C.dim, fontSize: 11, marginTop: 2 },
+  metricsRow: { flexDirection: 'row', paddingHorizontal: 12, paddingTop: 12, gap: 8 },
+  tile: { flex: 1, backgroundColor: C.surface, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 12 },
+  tileLabel: { color: C.dim, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.6 },
+  tileValue: { fontSize: 22, fontWeight: '700', marginTop: 6 },
+  tileHint: { color: C.dim, fontSize: 11, marginTop: 2 },
+  insightsSection: { paddingHorizontal: 16, paddingTop: 20 },
+  sectionTitle: { color: C.dim, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.6, marginBottom: 10 },
+  insightCard: { backgroundColor: C.surface, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 12, marginBottom: 8 },
+  insightText: { color: C.text, fontSize: 14, lineHeight: 20 },
 });
